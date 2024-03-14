@@ -1,0 +1,493 @@
+```{r, echo=FALSE}
+#in order to run this code, you will need to install these packages. You can do so by going to the install button, or by going to the console and typing, for example, install.packages("knitr")
+suppressPackageStartupMessages(library(knitr)) #makes pdfs
+suppressPackageStartupMessages(library(latex2exp))
+suppressPackageStartupMessages(library(tidyverse)) #good library for data manipulation, includes dplyr and ggplot
+# you can read more about the tidyverse at: https://r4ds.had.co.nz/
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Import and filter data
+nfl_stadiums = read.csv('archive/nfl_stadiums.csv')
+nfl_scores = read.csv('archive/spreadspoke_scores.csv')
+nfl_scores = dplyr::filter(nfl_scores, over_under_line != "" & weather_wind_mph != "" & score_home != "" & score_away != "")
+```
+
+```{r}
+# Add stadiums
+nfl_scores_with_stadiums = merge(x = spreadspoke_scores, y = nfl_stadiums, by.x = "stadium", by.y = "stadium_name")
+
+# Import and add weather data
+weather = read.csv('nfl_city_to_weather.csv')
+nfl_scores_with_weather = merge(x = nfl_scores_with_stadiums,y = weather,by.x = "stadium_location",by.y = "stadium_location")
+
+# Add the month the game was played
+nfl_scores_with_weather$month = month.name[month(as.POSIXlt(nfl_scores_with_weather$schedule_date, format="%m/%d/%Y"))]
+
+# Fancy R to get the avg wind of the month the game was played
+nfl_scores_with_weather = nfl_scores_with_weather %>% 
+  mutate(across(c(January,February,March,April,May,June,July,August,September,October,November,December), ~case_when(month == cur_column() ~ .), .names = 'new_{col}'),
+         avg_wind = coalesce(new_January, new_February, new_March, new_April, new_May, new_June, new_July, new_August, new_September, new_October, new_November, new_December), .keep="unused")
+```
+
+```{r}
+# Create linear model for total score using wind speed
+total_score_model = lm(score_home + score_away ~ weather_wind_mph, data = nfl_scores_with_weather)
+summary(total_score_model)
+```
+
+```{r}
+# Graph the total score by wind speed
+ggplot(data = nfl_scores_with_weather, aes(x = weather_wind_mph, y = score_home + score_away)) + geom_point() + ggtitle('Total Score by Wind Speed with Regression Line') + theme(plot.title = element_text(hjust = 0.5)) + xlab("Wind Speed (MPH)") + ylab("Total Score") + geom_smooth(method = "lm",se = FALSE)
+```
+```{r}
+# Create linear model for over under line using wind speed
+over_under_model = lm(over_under_line ~ weather_wind_mph, data = nfl_scores_with_weather)
+summary(over_under_model)
+```
+
+```{r}
+# Graph the over under line by wind speed
+ggplot(data = nfl_scores_with_weather, aes(x = weather_wind_mph, y = over_under_line)) + geom_point() + ggtitle('Over Under Line by Wind Speed with Regression Line') + theme(plot.title = element_text(hjust = 0.5)) + xlab("Wind Speed (MPH)") + ylab("Over Under Line") + geom_smooth(method = "lm",se = FALSE)
+```
+
+```{r}
+# Logistic model for if the score is below the line
+score_below_line_model = glm(score_home + score_away <= over_under_line ~ weather_wind_mph + avg_wind, family = binomial(), data = nfl_scores_with_weather)
+
+summary(score_below_line_model)
+```
+```{r}
+# Define bounds on green and red boxes based on expected positive returns above 11/21 = 0.523
+graph_bounds<-data.frame(xmin=c(-Inf,-Inf),
+               xmax=c(Inf,Inf),
+               ymin=c(0.523,-Inf),
+               ymax=c(Inf,0.523),
+               ExpectedPositiveReturn=c("Yes","No"))
+
+# Graph all points, regression line and red and green boxes
+ggplot(data = nfl_scores_with_weather, aes(x = weather_wind_mph, y = expected_above_line)) + geom_point() + ggtitle('Predicted Probability of Total Score Below or At Line by Wind Speed') + theme(plot.title = element_text(hjust = 0.5)) + xlab("Wind Speed (MPH)") + ylab("Predicted Probability of Total Score <= Line") + geom_smooth(method = "glm", method.args = list(family = "binomial"), se = FALSE) + geom_rect(data=graph_bounds,aes(xmin=xmin,ymin=ymin,xmax=xmax,ymax=ymax,fill=ExpectedPositiveReturn),alpha=0.2,inherit.aes=FALSE)+scale_fill_manual(values=c("red","green"),name = "Expected Positive Return")# + scale_color_manual(values=c(one='red', two='green', three='blue'), breaks=c("one","two","three"))
+```
+
+```{r}
+# Choose random 80% for train and 20% for test
+set.seed(100)
+train_ind <- sample(seq_len(nrow(nfl_scores_with_weather)), size = floor(0.8 * nrow(nfl_scores_with_weather)))
+train_data <- nfl_scores_with_weather[train_ind, ]
+test_data <- nfl_scores_with_weather[-train_ind, ]
+
+# Train on the training data
+train_model = glm(score_home + score_away <= over_under_line ~ weather_wind_mph + avg_wind, family = binomial(), data = train_data)
+
+# Predict the training data
+train_data$expected_above_line = predict.glm(train_model, train_data, type = 'response')
+
+# Test different probability lines
+low = 0.5
+high = 0.7
+step = 0.01
+bestGain = 0
+bestProbability = 0
+testProbability = low
+while (testProbability <= high) {
+  # The games to bet on
+  bet_on = train_data[train_data$expected_above_line > testProbability, ]
+  
+  # Check which games were won, tied or lost
+  bet_on_won = bet_on[bet_on$over_under_line > bet_on$score_home + bet_on$score_away,]
+  bet_on_tie = bet_on[bet_on$over_under_line == bet_on$score_home + bet_on$score_away,]
+  bet_on_lost = bet_on[bet_on$over_under_line < bet_on$score_home + bet_on$score_away,]
+  
+  # +100 dollars on games won, none on a tie, and -110 dollars on a loss
+  gain = 100*nrow(bet_on_won) - 110*nrow(bet_on_lost)
+  
+  # If better total gain, update bestProbability
+  if (gain > bestGain) {
+    bestGain = gain
+    bestProbability = testProbability
+  }
+  testProbability = testProbability + step
+}
+bestProbability
+bestGain
+
+# Predict the test data
+test_data$expected_above_line = predict.glm(train_model, test_data, type = 'response')
+
+# Calculate gain on test data
+bet_on = test_data[test_data$expected_above_line > bestProbability, ]
+bet_on_won = bet_on[bet_on$over_under_line > bet_on$score_home + bet_on$score_away,]
+bet_on_tie = bet_on[bet_on$over_under_line == bet_on$score_home + bet_on$score_away,]
+bet_on_lost = bet_on[bet_on$over_under_line < bet_on$score_home + bet_on$score_away,]
+testGain = 100*nrow(bet_on_won) - 110*nrow(bet_on_lost)
+testGain
+
+# Get per year expected gain
+totalGain = testGain*5
+perYearGain = totalGain/40
+perYearGain
+```
+
+
+```{r}
+#with_weather$expected_above_line = predict.glm(model6, with_weather, type = 'response')
+
+#ggplot(data = with_weather, aes(x = weather_wind_mph, y = expected_above_line)) + geom_point() + ggtitle('xG by distance to goal and play pattern') + theme(plot.title = element_text(hjust = 0.5))
+#with_weather[with_weather$expected_above_line < 0.47]
+low = 0.5
+high = 0.7
+tolerance = 0.0001
+best = 0
+bestVal = 0
+test = low
+while (test <= high) {
+
+  bet_on = with_weather[with_weather$expected_above_line > test, ]
+  dim(with_weather)
+  dim(bet_on)
+  bet_on_won = bet_on[bet_on$over_under_line > bet_on$score_home + bet_on$score_away,]
+  bet_on_tie = bet_on[bet_on$over_under_line == bet_on$score_home + bet_on$score_away,]
+  bet_on_lost = bet_on[bet_on$over_under_line < bet_on$score_home + bet_on$score_away,]
+  val = 100*nrow(bet_on_won) - 110*nrow(bet_on_lost)
+  if (val > best) {
+    best = val
+    bestVal = test
+  }
+  test = test + tolerance
+}
+best
+bestVal
+```
+
+
+
+
+
+```{r}
+#with_weather$expected_above_line = predict.glm(model6, with_weather, type = 'response')
+
+#ggplot(data = with_weather, aes(x = weather_wind_mph, y = expected_above_line)) + geom_point() + ggtitle('xG by distance to goal and play pattern') + theme(plot.title = element_text(hjust = 0.5))
+#with_weather[with_weather$expected_above_line < 0.47]
+low = 0.5
+high = 0.7
+tolerance = 0.0001
+best = 0
+bestVal = 0
+test = low
+while (test <= high) {
+
+  bet_on = with_weather[with_weather$expected_above_line > test, ]
+  dim(with_weather)
+  dim(bet_on)
+  bet_on_won = bet_on[bet_on$over_under_line > bet_on$score_home + bet_on$score_away,]
+  bet_on_tie = bet_on[bet_on$over_under_line == bet_on$score_home + bet_on$score_away,]
+  bet_on_lost = bet_on[bet_on$over_under_line < bet_on$score_home + bet_on$score_away,]
+  val = 100*nrow(bet_on_won) - 110*nrow(bet_on_lost)
+  if (val > best) {
+    best = val
+    bestVal = test
+  }
+  test = test + tolerance
+}
+best
+bestVal
+```
+
+
+```{r}
+set.seed(128)
+train_ind <- sample(seq_len(nrow(with_weather)), size = floor(0.8 * nrow(with_weather)))
+
+train <- with_weather[train_ind, ]
+test <- with_weather[-train_ind, ]
+
+train_model = glm(score_home + score_away <= over_under_line ~ weather_wind_mph + avg_wind, family = binomial(), data = with_weather)
+#summary(model6)
+
+test$expected_above_line = predict.glm(train_model, test, type = 'response')
+
+bet_on = test[test$expected_above_line > 0.547, ]
+dim(bet_on)
+dim(test)
+bet_on_won = bet_on[bet_on$over_under_line > bet_on$score_home + bet_on$score_away,]
+bet_on_tie = bet_on[bet_on$over_under_line == bet_on$score_home + bet_on$score_away,]
+bet_on_lost = bet_on[bet_on$over_under_line < bet_on$score_home + bet_on$score_away,]
+nrow(bet_on_won)
+nrow(bet_on_lost)
+100*nrow(bet_on_won) - 110*nrow(bet_on_lost)
+```
+
+
+
+
+
+
+
+
+
+```{r}
+library(ggplot2)
+scores_copy = spreadspoke_scores
+
+scores_copy$pred_total = predict(total_score_model, scores_copy)
+
+ggplot(data = scores_copy, aes(x = score_home + score_away, y = pred_total)) + geom_point() + geom_function(fun = identity, aes(color = 'y=x')) + labs(color = '') + ggtitle('Without Regularization') + theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+model2 = lm(over_under_line ~ weather_wind_mph, data = with_weather)
+
+summary(model2)
+AIC(model2)
+```
+
+````{r}
+library(ggplot2)
+#scores_copy = spreadspoke_scores
+
+#scores_copy$pred_total = predict(model5, scores_copy)
+
+coeff<-coefficients(model2)           
+intercept<-coeff[1] 
+slope<- coeff[2]
+
+ggplot(data = spreadspoke_scores, aes(x = weather_wind_mph, y = over_under_line)) + geom_point() + geom_abline(intercept = intercept, slope = slope) + labs(color = '') + ggtitle('Over Under Line against Wind Speed') + theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+model3 = lm(score_home + score_away ~ over_under_line - 1, data = spreadspoke_scores)
+
+summary(model3)
+```
+
+
+```{r}
+ Nsamp=100
+x=seq(1,100,1)*.1+100 # x=101.1,101.2,....
+y=rnorm(n=length(x))+100 # random noise +100 (best model is constant)
+
+model_withint=lm(y~x)
+print(summary(model_withint))
+flush.console()
+model_noint=lm(y~x+0) 
+print(summary(model_noint))
+print (AIC(model_withint))
+print(sprintf ('without intercept  AIC=%f',AIC(model_noint)))
+print(sprintf ('with intercept  AIC=%f',AIC(model_withint)))
+print(sprintf ('constant model  AIC=%f',AIC(lm(y~1))))
+plot(x,y,ylim=c(0,105),xlim=c(0,105))
+lines( c(0,105),c(0,105)*model_noint$coefficients['x'],col=c('blue'))
+lines( c(0,105),c(1,1)*(lm(y~1)$coefficients['(Intercept)']),col=c('red'))
+```
+
+```{r}
+model4 = lm(score_home + score_away - over_under_line ~ weather_wind_mph, data = spreadspoke_scores)
+
+summary(model4)
+AIC(model4)
+```
+
+```{r}
+model5 = lm(score_home + score_away ~ weather_wind_mph + over_under_line, data = spreadspoke_scores)
+
+summary(model5)
+AIC(model5)
+```
+
+````{r}
+library(ggplot2)
+scores_copy = spreadspoke_scores
+
+scores_copy$pred_total = predict(model5, scores_copy)
+
+ggplot(data = scores_copy, aes(x = score_home + score_away, y = pred_total)) + geom_point() + geom_function(fun = identity, aes(color = 'y=x')) + labs(color = '') + ggtitle('Without Regularization') + theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+````{r}
+library(ggplot2)
+#scores_copy = spreadspoke_scores
+
+#scores_copy$pred_total = predict(model5, scores_copy)
+
+coeff<-coefficients(model)           
+intercept<-coeff[1] 
+slope<- coeff[2]
+
+ggplot(data = spreadspoke_scores, aes(x = weather_wind_mph, y = score_home + score_away)) + geom_point() + geom_abline(intercept = intercept, slope = slope) + labs(color = '') + ggtitle('Total Points against Wind Speed') + theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+res <- resid(model5)
+plot(fitted(model5), res, main="Residuals vs Fitted",
+  xlab="Fitted values", ylab="Residuals")
+abline(0,0)
+```
+
+```{r}
+spreadspoke_scores %>%
+  group_by(score_home + score_away > over_under_line, score_home + score_away == over_under_line) %>%
+  summarise(
+    asdf = n()
+  )
+```
+
+```{r}
+model6 = glm(score_home + score_away > over_under_line ~ weather_wind_mph, family = binomial(), data = spreadspoke_scores)
+
+summary(model6)
+```
+
+```{r}
+#unique(spreadspoke_scores$stadium)
+#View(nfl_stadiums)
+#View(data.frame(unique(nfl_stadiums$stadium_location)))
+
+with_stadiums = merge(x = spreadspoke_scores, y = nfl_stadiums, by.x = "stadium", by.y = "stadium_name")
+with_stadiums$month = month.name[month(as.POSIXlt(with_weather$schedule_date, format="%m/%d/%Y"))]
+
+weather = read.csv('nfl_city_to_weather.csv')
+
+
+with_weather$avg_wind
+
+with_weather = merge(x = with_stadiums,y = weather,by.x = "stadium_location",by.y = "stadium_location")
+#View(with_weather)
+dim(spreadspoke_scores)
+dim(with_stadiums)
+dim(with_weather)
+with_weather$month = month.name[month(as.POSIXlt(with_weather$schedule_date, format="%m/%d/%Y"))]
+#with_weather$avg_wind = with_weather[[with_weather$month]]
+
+with_weather = with_weather %>% 
+  mutate(across(c(January,February,March,April,May,June,July,August,September,October,November,December), ~case_when(month == cur_column() ~ .), .names = 'new_{col}'),
+         avg_wind = coalesce(new_January, new_February, new_March, new_April, new_May, new_June, new_July, new_August, new_September, new_October, new_November, new_December), .keep="unused")
+  #month.name[month(as.POSIXlt(with_weather$schedule_date, format="%m/%d/%Y"))]
+
+#rrr %>%
+ #  rowwise %>%
+  # mutate(newColumn = cur_data()[[co]]) %>%
+   #ungroup
+#unique(with_stadiums$stadium_location)[1]
+#unique(weather$stadium_location)[2]
+#unique(with_stadiums$stadium_location)[1] == "San Antonio, TX"
+#unique(weather$stadium_location)[2] == "San Antonio, TX"
+#unique(with_stadiums$stadium_location)[1] == unique(weather$stadium_location)[2]
+```
+
+```{r}
+View(with_weather)
+```
+
+```{r}
+with_weather$wind_difference = with_weather$weather_wind_mph - with_weather$avg_wind
+model7 = lm(score_home + score_away ~ weather_wind_mph + over_under_line + stadium_type, data = with_weather)
+
+summary(model7)
+```
+
+```{r}
+#table(with_stadiums$stadium_location)
+unique(with_stadiums$stadium_location)
+```
+
+
+```{r}
+model6 = glm(score_home + score_away <= over_under_line ~ weather_wind_mph + avg_wind, family = binomial(), data = with_weather)
+
+summary(model6)
+```
+
+```{r}
+logistic_model = glm(score_home + score_away <= over_under_line ~ weather_wind_mph + avg_wind, family = binomial(), data = with_weather)
+with_weather$expected_above_line = predict.glm(logistic_model, with_weather, type = 'response')
+summary(logistic_model)
+
+intercept = exp(coef(logistic_model)[["(Intercept)"]])/(1+exp(coef(logistic_model)[["(Intercept)"]]))
+intercept
+
+#scale_color_manual(name='Positive Expected Return', breaks=c('Yes', 'No'), values=c(Yes='blue', No='red'))
+
+df<-data.frame(xmin=c(-Inf,-Inf),
+               xmax=c(Inf,Inf),
+               ymin=c(0.54,-Inf),
+               ymax=c(Inf,0.54),
+               ExpectedPositiveReturn=c("Yes","No"))
+
+#annotate("rect", xmin = -Inf, xmax = Inf, ymin = 0.54, ymax = Inf, fill = "blue", alpha = .2, color = NA) + annotate("rect", xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = 0.54, fill = "red", alpha = .2, color = NA)
+
+ggplot(data = with_weather, aes(x = weather_wind_mph, y = expected_above_line)) + geom_point() + ggtitle('Predicted Probability of Total Score Below or At Line by Wind Speed') + theme(plot.title = element_text(hjust = 0.5)) + xlab("Wind Speed (MPH)") + ylab("Predicted Probability of Total Score <= Line") + geom_smooth(method = "glm", method.args = list(family = "binomial"), se = FALSE) + geom_rect(data=df,aes(xmin=xmin,ymin=ymin,xmax=xmax,ymax=ymax,fill=ExpectedPositiveReturn),alpha=0.2,inherit.aes=FALSE)+scale_fill_manual(values=c("red","green"),name = "Expected Positive Return")# + scale_color_manual(values=c(one='red', two='green', three='blue'), breaks=c("one","two","three"))
+```
+
+
+```{r}
+#with_weather$expected_above_line = predict.glm(model6, with_weather, type = 'response')
+
+#ggplot(data = with_weather, aes(x = weather_wind_mph, y = expected_above_line)) + geom_point() + ggtitle('xG by distance to goal and play pattern') + theme(plot.title = element_text(hjust = 0.5))
+#with_weather[with_weather$expected_above_line < 0.47]
+low = 0.5
+high = 0.7
+tolerance = 0.0001
+best = 0
+bestVal = 0
+test = low
+while (test <= high) {
+
+  bet_on = with_weather[with_weather$expected_above_line > test, ]
+  dim(with_weather)
+  dim(bet_on)
+  bet_on_won = bet_on[bet_on$over_under_line > bet_on$score_home + bet_on$score_away,]
+  bet_on_tie = bet_on[bet_on$over_under_line == bet_on$score_home + bet_on$score_away,]
+  bet_on_lost = bet_on[bet_on$over_under_line < bet_on$score_home + bet_on$score_away,]
+  val = 100*nrow(bet_on_won) - 110*nrow(bet_on_lost)
+  if (val > best) {
+    best = val
+    bestVal = test
+  }
+  test = test + tolerance
+}
+best
+bestVal
+```
+
+
+```{r}
+set.seed(128)
+train_ind <- sample(seq_len(nrow(with_weather)), size = floor(0.8 * nrow(with_weather)))
+
+train <- with_weather[train_ind, ]
+test <- with_weather[-train_ind, ]
+
+train_model = glm(score_home + score_away <= over_under_line ~ weather_wind_mph + avg_wind, family = binomial(), data = with_weather)
+#summary(model6)
+
+test$expected_above_line = predict.glm(train_model, test, type = 'response')
+
+bet_on = test[test$expected_above_line > 0.547, ]
+dim(bet_on)
+dim(test)
+bet_on_won = bet_on[bet_on$over_under_line > bet_on$score_home + bet_on$score_away,]
+bet_on_tie = bet_on[bet_on$over_under_line == bet_on$score_home + bet_on$score_away,]
+bet_on_lost = bet_on[bet_on$over_under_line < bet_on$score_home + bet_on$score_away,]
+nrow(bet_on_won)
+nrow(bet_on_lost)
+100*nrow(bet_on_won) - 110*nrow(bet_on_lost)
+```
+
+
+```{r}
+score_total_model = lm(score_home + score_away ~ weather_wind_mph, data = with_weather)
+over_under_model = lm(over_under_line ~ weather_wind_mph, data = with_weather)
+summary(score_total_model)
+#summary(model)$coefficients["Estimate"]
+#coef(model)[["weather_wind_mph"]]
+#coef(model)[["(Intercept)"]]
+#geom_abline(intercept = coef(model)[["(Intercept)"]], slope = coef(model)[["weather_wind_mph"]], col = "red")
+ggplot(data = with_weather, aes(x = weather_wind_mph, y = score_home + score_away)) + geom_point() + ggtitle('Total Score by Wind Speed with Regression Line') + theme(plot.title = element_text(hjust = 0.5)) + xlab("Wind Speed (MPH)") + ylab("Total Score") + geom_smooth(method = "lm",se = FALSE)
+```
+
+
+```
